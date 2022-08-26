@@ -54,3 +54,6 @@ impl Drop for Mount {
     }
 }
 unsafe impl Send for Mount {}
+// Safety: the `*mut c_void` pointer is only used at Drop time, so even if references to `Mount` are
+// shared between threads, they can't use this pointer for anything.
+unsafe impl Sync for Mount {}
