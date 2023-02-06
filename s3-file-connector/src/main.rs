@@ -1,14 +1,19 @@
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
 use aws_crt_s3::common::rust_log_adapter::RustLogAdapter;
 use clap::{ArgGroup, Parser};
 use fuser::{BackgroundSession, MountOption, Session};
+use nix::sys::signal::Signal;
+use nix::unistd::ForkResult;
 use s3_client::{AddressingStyle, Endpoint, HeadBucketError, S3ClientConfig, S3CrtClient, S3RequestError};
-
 use s3_file_connector::fs::S3FilesystemConfig;
 use s3_file_connector::fuse::S3FuseFilesystem;
 use s3_file_connector::metrics::{metrics_tracing_span_layer, MetricsSink};
+use signal_hook::iterator::Signals;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -91,6 +96,9 @@ struct CliArgs {
 
     #[clap(long, help = "File permissions [default: 0644]", value_parser = parse_perm_bits)]
     pub file_mode: Option<u16>,
+
+    #[clap(short, long, help = "Run as foreground process")]
+    pub foreground: bool,
 }
 
 impl CliArgs {
@@ -106,8 +114,6 @@ impl CliArgs {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_tracing_subscriber();
-
     let args = CliArgs::parse();
 
     // validate mount point
@@ -118,36 +124,81 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
-    let mut options = vec![
-        MountOption::RO,
-        MountOption::DefaultPermissions,
-        MountOption::FSName("fuse_sync".to_string()),
-        MountOption::NoAtime,
-    ];
-    if args.auto_unmount {
-        options.push(MountOption::AutoUnmount);
-    }
-    if args.allow_root {
-        options.push(MountOption::AllowRoot);
-    }
-    if args.allow_other {
-        options.push(MountOption::AllowOther);
+    if args.foreground {
+        // mount file system as a foreground process
+        init_tracing_subscriber();
+        let session = mount(args)?;
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+
+        ctrlc::set_handler(move || {
+            let _ = sender.send(());
+        })
+        .context("Failed to install signal handler")
+        .unwrap();
+
+        let _ = receiver.recv();
+
+        drop(session);
+    } else {
+        // mount file system as a background process
+        // SAFETY: Child process has full ownership of its resources.
+        // There is no shared data between parent and child processes.
+        let pid = unsafe { nix::unistd::fork() };
+        match pid.expect("Failed to fork mount process") {
+            ForkResult::Child => {
+                init_tracing_subscriber();
+
+                let parent_pid = nix::unistd::getppid();
+                let child_args = CliArgs::parse();
+                let session = mount(child_args);
+                match session {
+                    Ok(_session) => {
+                        let _ = nix::sys::signal::kill(parent_pid, Signal::SIGCONT);
+                        // the session stays running because its lifetime is bound to the match statement.
+                        // it won't be dropped until after the park.
+                        thread::park();
+
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let _ = nix::sys::signal::kill(parent_pid, Signal::SIGINT);
+                        return Err(anyhow!(e));
+                    }
+                }
+            }
+            ForkResult::Parent { child } => {
+                init_tracing_subscriber();
+
+                let (interrupt_tx, interrupt_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || await_interrupt(interrupt_tx));
+
+                let timeout = Duration::from_secs(30);
+                // wait for signal from child process.
+                let signal = interrupt_rx.recv_timeout(timeout);
+
+                match signal {
+                    Ok(true) => tracing::debug!("success signal received from child process"),
+                    Ok(false) => return Err(anyhow!("Failed to create mount process")),
+                    Err(_timeout_err) => {
+                        // kill child process before returning error.
+                        if let Err(e) = nix::sys::signal::kill(child, Signal::SIGTERM) {
+                            tracing::warn!("Unable to kill hanging child process with SIGTERM: {:?}", e);
+                        }
+                        return Err(anyhow!(
+                            "Timeout after {} seconds while waiting for mount process to be ready",
+                            timeout.as_secs()
+                        ));
+                    }
+                }
+            }
+        }
     }
 
-    let mut filesystem_config = S3FilesystemConfig::default();
-    if let Some(uid) = args.uid {
-        filesystem_config.uid = uid;
-    }
-    if let Some(gid) = args.gid {
-        filesystem_config.gid = gid;
-    }
-    if let Some(dir_mode) = args.dir_mode {
-        filesystem_config.dir_mode = dir_mode;
-    }
-    if let Some(file_mode) = args.file_mode {
-        filesystem_config.file_mode = file_mode;
-    }
+    Ok(())
+}
 
+fn mount(args: CliArgs) -> anyhow::Result<BackgroundSession> {
     let throughput_target_gbps = args.throughput_target_gbps.map(|t| t as f64);
 
     let addressing_style = args.addressing_style();
@@ -174,6 +225,20 @@ fn main() -> anyhow::Result<()> {
     .context("Failed to create S3 client")?;
     let runtime = client.event_loop_group();
 
+    let mut filesystem_config = S3FilesystemConfig::default();
+    if let Some(uid) = args.uid {
+        filesystem_config.uid = uid;
+    }
+    if let Some(gid) = args.gid {
+        filesystem_config.gid = gid;
+    }
+    if let Some(dir_mode) = args.dir_mode {
+        filesystem_config.dir_mode = dir_mode;
+    }
+    if let Some(file_mode) = args.file_mode {
+        filesystem_config.file_mode = file_mode;
+    }
+
     let fs = S3FuseFilesystem::new(
         client,
         runtime,
@@ -181,6 +246,23 @@ fn main() -> anyhow::Result<()> {
         args.prefix.as_deref().unwrap_or(""),
         filesystem_config,
     );
+
+    let fs_name = String::from("s3-file-connector");
+    let mut options = vec![
+        MountOption::RO,
+        MountOption::DefaultPermissions,
+        MountOption::FSName(fs_name),
+        MountOption::NoAtime,
+    ];
+    if args.auto_unmount {
+        options.push(MountOption::AutoUnmount);
+    }
+    if args.allow_root {
+        options.push(MountOption::AllowRoot);
+    }
+    if args.allow_other {
+        options.push(MountOption::AllowOther);
+    }
 
     let session = Session::new(fs, &args.mount_point, &options).context("Failed to create FUSE session")?;
 
@@ -193,18 +275,19 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("successfully mounted {:?}", args.mount_point);
 
-    let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+    Ok(session)
+}
 
-    ctrlc::set_handler(move || {
-        let _ = sender.send(());
-    })
-    .context("Failed to install signal handler")?;
+fn await_interrupt(interrupt_notification_channel: Sender<bool>) {
+    let mut signals = Signals::new([nix::libc::SIGCONT, nix::libc::SIGINT]).unwrap();
 
-    let _ = receiver.recv();
-
-    drop(session);
-
-    Ok(())
+    for signal in signals.into_iter() {
+        let _ = match signal {
+            nix::libc::SIGCONT => interrupt_notification_channel.send(true),
+            nix::libc::SIGINT => interrupt_notification_channel.send(false),
+            _ => unreachable!(),
+        };
+    }
 }
 
 /// Create a client for a bucket in the given region and send a HeadBucket request to validate it's
