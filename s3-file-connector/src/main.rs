@@ -1,3 +1,6 @@
+use std::fs::File;
+use std::io::{Write, Read};
+use std::os::unix::prelude::FromRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -142,16 +145,28 @@ fn main() -> anyhow::Result<()> {
         drop(session);
     } else {
         // mount file system as a background process
+
+        let (read_fd, write_fd) = nix::unistd::pipe()?;
+
         // SAFETY: Child process has full ownership of its resources.
         // There is no shared data between parent and child processes.
         let pid = unsafe { nix::unistd::fork() };
         match pid.expect("Failed to fork mount process") {
             ForkResult::Child => {
-                init_tracing_subscriber();
+                // init_tracing_subscriber();
 
                 let parent_pid = nix::unistd::getppid();
                 let child_args = CliArgs::parse();
                 let session = mount(child_args);
+
+                // close unused file descriptor, we only write from this end.
+                nix::unistd::close(read_fd)?;
+
+                // SAFETY: `write_fd` is a valid file descriptor.
+                let mut f = unsafe { File::from_raw_fd(write_fd) };
+                write!(&mut f, "success")?;
+                
+                nix::unistd::close(write_fd)?;
                 match session {
                     Ok(_session) => {
                         let _ = nix::sys::signal::kill(parent_pid, Signal::SIGCONT);
@@ -170,27 +185,16 @@ fn main() -> anyhow::Result<()> {
             ForkResult::Parent { child } => {
                 init_tracing_subscriber();
 
-                let (interrupt_tx, interrupt_rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || await_interrupt(interrupt_tx));
+                // close unused file descriptor, we only read from this end.
+                nix::unistd::close(write_fd)?;
 
-                let timeout = Duration::from_secs(30);
-                // wait for signal from child process.
-                let signal = interrupt_rx.recv_timeout(timeout);
+                // SAFETY: `read_fd` is a valid file descriptor.
+                let mut rf = unsafe { File::from_raw_fd(read_fd) };
+                let mut input = String::new();
+                rf.read_to_string(&mut input)?;
+                nix::unistd::close(read_fd)?;
 
-                match signal {
-                    Ok(true) => tracing::debug!("success signal received from child process"),
-                    Ok(false) => return Err(anyhow!("Failed to create mount process")),
-                    Err(_timeout_err) => {
-                        // kill child process before returning error.
-                        if let Err(e) = nix::sys::signal::kill(child, Signal::SIGTERM) {
-                            tracing::warn!("Unable to kill hanging child process with SIGTERM: {:?}", e);
-                        }
-                        return Err(anyhow!(
-                            "Timeout after {} seconds while waiting for mount process to be ready",
-                            timeout.as_secs()
-                        ));
-                    }
-                }
+                println!("received message: {}", input);
             }
         }
     }
